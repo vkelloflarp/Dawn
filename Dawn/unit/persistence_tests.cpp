@@ -219,8 +219,14 @@ int main(int argc,char** argv) {
     dawn::core::settings::Settings fixtureSettings{};
     CHECK(dawn::core::settings::parse(fixtureJson,fixtureSettings));
     CHECK(fixtureSettings.initialAccount.primarySoid==0x9EAA300100100100ULL);
-    CHECK(fixtureSettings.initialAccount.characterCount==3);
-    CHECK(fixtureSettings.initialAccount.characters[0].soid==0x9EAA300100100101ULL);
+    // The shipped settings seed no character. The player creates the first one, which is built
+    // from one of these templates, one per class.
+    CHECK(fixtureSettings.initialAccount.characterCount==0);
+    CHECK(fixtureSettings.characterTemplates.characterCount==3);
+    CHECK(fixtureSettings.characterTemplates.characters[0].soid==0x9EAA300100100101ULL);
+    CHECK(fixtureSettings.characterTemplates.characters[0].characterClass==CharacterClass::hunter);
+    CHECK(fixtureSettings.characterTemplates.characters[1].characterClass==CharacterClass::titan);
+    CHECK(fixtureSettings.characterTemplates.characters[2].characterClass==CharacterClass::warlock);
     CHECK(std::count(fixtureSettings.initialUnlocks.accountFlags.begin(),
                      fixtureSettings.initialUnlocks.accountFlags.end(),
                      unlocks::kFlagSet)!=0);
@@ -256,6 +262,87 @@ int main(int argc,char** argv) {
     CHECK(unlocks==unlocks::expand(fixtureSettings.initialUnlocks,
                                    fixtureSettings.initialAccount));
     CHECK(loadedFamily==fixtureSettings.initialFamily5);
+    {
+        // The shipped account starts with no character. Creating one grows the stored account, and
+        // that has to commit and read back. Dropping one would strand its rows, so that stays refused.
+        static AccountState created{};created=loaded;
+        created.characters[0]=fixtureSettings.characterTemplates.characters[1];
+        created.characters[0].soid=created.primarySoid+1U;
+        created.characterCount=1;
+        CHECK(account::valid(created));
+        CHECK(durable::commit_account(loaded,created));
+        CHECK(!durable::commit_account(created,loaded));
+        {
+            // Deleting a character removes its row and every durable row it owned, and leaves the
+            // others exactly as they were, under the keys they already had.
+            const auto reseed=[](CharacterState& character,std::uint64_t soid,std::uint64_t firstItem) {
+                character.soid=soid;
+                for(std::optional<account::inventory::Item>& item:character.equipment.slots)
+                    if(item.has_value())item->instanceSoid=firstItem++;
+                for(std::size_t i=0;i<character.inventory.count;++i)
+                    character.inventory.values[i].instanceSoid=firstItem++;
+            };
+            static AccountState two{};two=created;
+            reseed(two.characters[0],two.primarySoid+1U,0x7000000000000000ULL);
+            two.characters[1]=fixtureSettings.characterTemplates.characters[2];
+            reseed(two.characters[1],two.primarySoid+2U,0x7100000000000000ULL);
+            two.characterCount=2;
+            CHECK(account::valid(two));
+            CHECK(durable::commit_account(created,two));
+            const std::uint64_t first=two.characters[0].soid,second=two.characters[1].soid;
+            CHECK(durable::store_objective(durable::Scope::characterObject,first,5,11));
+            CHECK(durable::store_objective(durable::Scope::characterObject,second,5,22));
+            static AccountState gone{};gone=two;
+            gone.characters[0]=two.characters[1];gone.characters[1]={};gone.characterCount=1;
+            CHECK(account::valid(gone));
+            // Only the character actually removed may leave, and the survivors must not move.
+            CHECK(!durable::commit_character_removal(two,gone,0));
+            CHECK(!durable::commit_character_removal(two,gone,first+0x10U));
+            CHECK(!durable::commit_character_removal(two,two,first));
+            CHECK(!durable::commit_character_removal(two,gone,second));
+            CHECK(durable::commit_character_removal(two,gone,first));
+            // The removed character no longer exists, so its rows are counted straight from the file.
+            const auto ownerRows=[](std::uint64_t owner) {
+                sqlite3* connection{};CHECK(sqlite3_open16(database_path().c_str(),&connection)==SQLITE_OK);
+                sqlite3_stmt* count{};char text[17]{};
+                std::snprintf(text,sizeof text,"%016llX",static_cast<unsigned long long>(owner));
+                CHECK(sqlite3_prepare_v2(connection,"SELECT COUNT(*) FROM durable_objectives WHERE owner_soid=?1",-1,&count,nullptr)==SQLITE_OK);
+                CHECK(sqlite3_bind_text(count,1,text,-1,SQLITE_TRANSIENT)==SQLITE_OK&&sqlite3_step(count)==SQLITE_ROW);
+                const int rows=sqlite3_column_int(count,0);
+                sqlite3_finalize(count);sqlite3_close(connection);return rows;
+            };
+            bool foundKept=false;std::int32_t keptValue=0,ignored=0;
+            CHECK(ownerRows(first)==0);
+            CHECK(ownerRows(second)==1);
+            CHECK(durable::load_objective(durable::Scope::characterObject,second,5,foundKept,keptValue));
+            CHECK(foundKept&&keptValue==22);
+            // The freed key is reusable and must not inherit anything from its previous owner.
+            static AccountState regrown{};regrown=gone;
+            regrown.characters[1]=fixtureSettings.characterTemplates.characters[1];
+            reseed(regrown.characters[1],first,0x7200000000000000ULL);
+            regrown.characterCount=2;
+            CHECK(account::valid(regrown));
+            CHECK(durable::commit_account(gone,regrown));
+            bool foundReused=true;
+            CHECK(durable::load_objective(durable::Scope::characterObject,first,5,foundReused,ignored));
+            CHECK(!foundReused&&ownerRows(first)==0);
+            CHECK(durable::commit_character_removal(regrown,gone,first));
+            // Removing the last remaining character leaves an empty, valid account.
+            static AccountState empty{};empty=gone;empty.characters[0]={};empty.characterCount=0;
+            CHECK(account::valid(empty));
+            CHECK(durable::commit_character_removal(gone,empty,second));
+            CHECK(durable::commit_account(empty,created));
+        }
+        durable::shutdown();
+        static AccountState reloaded{};static unlocks::ScopedTable reloadedUnlocks{};static Family5State reloadedFamily{};
+        CHECK(durable::initialize(GetModuleHandleW(nullptr),fixtureSettings.initialAccount,
+            fixtureSettings.initialUnlocks,fixtureSettings.initialFamily5,reloaded,reloadedUnlocks,reloadedFamily));
+        CHECK(reloaded==created);
+        durable::shutdown();
+        remove_database();
+        CHECK(durable::initialize(GetModuleHandleW(nullptr),fixtureSettings.initialAccount,
+            fixtureSettings.initialUnlocks,fixtureSettings.initialFamily5,loaded,unlocks,loadedFamily));
+    }
     durable::shutdown();
     remove_database();
     test_vendor_migrations(legacy,legacyUnlocks,family);

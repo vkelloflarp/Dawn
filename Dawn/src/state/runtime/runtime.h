@@ -317,6 +317,34 @@ void shutdown() noexcept;
 [[nodiscard]] bool set_selected_character(std::uint64_t characterSoid, bool& changed) noexcept;
 
 /**
+ * Adds one character to the account from the authored template of the requested class.
+ * The character takes the requested identity and its own item instances, and is stored before this
+ * returns, so the next roster the Client asks for already lists it. It is not selected: the
+ * Client names its pick afterwards in the select-character request.
+ * @param race Race the player chose.
+ * @param gender Gender the player chose.
+ * @param characterClass Class the player chose, which picks the template.
+ * @param characterSoid Receives the new character's key.
+ * @return False when the account has no free slot, the account key is not set, no template of
+ * that class is authored, or the resulting account does not validate. State is unchanged then.
+ */
+[[nodiscard]] bool create_character(CharacterRace race,
+                                    CharacterGender gender,
+                                    CharacterClass characterClass,
+                                    std::uint64_t& characterSoid) noexcept;
+
+/**
+ * Removes one character from the account, with everything the account stored for it.
+ * The other characters keep their keys and their order, so the Client's view of them stays valid.
+ * The removed character's items, missions, progress and unlocks go with it. If it was the selected
+ * character the account is left with no selection, as it is at character select.
+ * @param characterSoid Key of the character the player deleted.
+ * @return False when the account has no such character or the result cannot be stored. State is
+ * unchanged then.
+ */
+[[nodiscard]] bool delete_character(std::uint64_t characterSoid) noexcept;
+
+/**
  * Prepares an equip operation for one unequipped instance on the selected character.
  * An occupied slot is swapped; an empty semantic slot receives the requested item directly.
  *
@@ -572,6 +600,9 @@ struct ProfileExchangePayout {
 
 /** @return A copy of the active account state, read under the lock. */
 [[nodiscard]] AccountState account_snapshot() noexcept;
+
+/** @return How many characters the active account holds, read under the lock without a copy. */
+[[nodiscard]] std::size_t account_character_count() noexcept;
 
 /** @return True when the named existing character currently equips an allowed Festival mask. */
 [[nodiscard]] bool has_current_equipped_festival_mask(std::uint64_t characterId) noexcept;

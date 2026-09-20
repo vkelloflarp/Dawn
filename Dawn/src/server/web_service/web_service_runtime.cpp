@@ -15,6 +15,7 @@
 #include "../../middleware/web_service/messages/opcode205.h"
 #include "../../middleware/web_service/messages/opcode206.h"
 #include "../../middleware/web_service/messages/opcode501_codec.h"
+#include "../../middleware/web_service/messages/opcode502.h"
 #include "../../middleware/web_service/messages/opcode503.h"
 #include "../../middleware/web_service/messages/opcode504.h"
 #include "../../middleware/web_service/messages/opcode601/opcode601_codec.h"
@@ -27,6 +28,7 @@
 #include "../../state/activity/events/activity_event_selection.h"
 #include "../../state/build_data/runtime.h"
 #include "../../state/runtime/runtime.h"
+#include "../../client/hooks/bootflow/internal.h"
 #include "opcode_routes.h"
 #include "web_service_actions.h"
 #include "settings_save.h"
@@ -164,6 +166,10 @@ bool consume(std::span<const std::byte> request,
         return false;
     }
     report_request(message);
+    // A character created earlier is selected, and the Client's sign-in step leaves for the game
+    // once its hold is off. This is the first request after that creation, so the Client has taken
+    // in the account that names the selection by now.
+    client::hooks::bootflow::apply_character_select_release();
 
     if(message.opcode==405) {
         middleware::web_service::messages::opcode405::Request serviceRequest{};state::vendors::Pending recovery;
@@ -255,11 +261,27 @@ bool consume(std::span<const std::byte> request,
     }
 
     if (message.opcode == middleware::web_service::messages::opcode501::kOpcode) {
-        // Returns a SOID family three already publishes. The request body is not parsed.
-        const std::uint64_t characterSoid =
-            state::account::selected_character_soid(state::account_snapshot());
-        return middleware::web_service::messages::opcode501::encode_response(
-                   message, characterSoid, response, written)
+        namespace opcode501 = middleware::web_service::messages::opcode501;
+        // The reply must name a SOID family three publishes. The Client asks for the roster again
+        // right after it, and that snapshot is built from State, so a character created here is
+        // already listed by then. The roster is not enough on its own: the Client reads the new
+        // character's item records from Family 4, so the caller is told to refresh that too.
+        std::uint64_t characterSoid = 0;
+        opcode501::Request choices{};
+        if (opcode501::parse_request(message, choices)
+            && state::create_character(static_cast<state::CharacterRace>(choices.race),
+                                       static_cast<state::CharacterGender>(choices.gender),
+                                       static_cast<state::CharacterClass>(choices.characterClass),
+                                       characterSoid)) {
+            outcome.rosterChanged = true;
+            client::hooks::bootflow::request_character_select_release();
+        } else {
+            // Nothing was created. State logs its own refusal, and a body that does not parse is
+            // already in the request line. Answer with an existing character's SOID, as this
+            // request did before it could create one.
+            characterSoid = state::account::selected_character_soid(state::account_snapshot());
+        }
+        return opcode501::encode_response(message, characterSoid, response, written)
                || encode_echo(message, response, written);
     }
 
@@ -277,6 +299,8 @@ bool consume(std::span<const std::byte> request,
     bool dispatched = true;
     if (message.opcode == middleware::web_service::messages::opcode504::kOpcode) {
         select_character(message, outcome);
+    } else if (message.opcode == middleware::web_service::messages::opcode502::kOpcode) {
+        delete_character(message, outcome);
     } else if (message.opcode == kItemDismantleOpcode) {
         dismantle_item(message, outcome);
     } else if (message.opcode == kEquipOpcode) {
@@ -315,7 +339,8 @@ bool consume(std::span<const std::byte> request,
     } else {
         dispatched = false;
     }
-    const bool prepared = outcome.hasSelectedCharacter || outcome.mutation.index() != kNoMutation;
+    const bool prepared = outcome.hasSelectedCharacter || outcome.rosterChanged
+                          || outcome.mutation.index() != kNoMutation;
 
     middleware::web_service::ResponseShape shape{};
     resolve_response_shape(message.opcode, shape);

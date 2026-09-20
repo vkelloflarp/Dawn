@@ -40,6 +40,11 @@ struct Settings {
     steam::Settings steam;
     /** Complete authored account State, or an empty account. */
     state::AccountState initialAccount;
+    /**
+     * Authored characters a create-character request is built from, one per class. Only the
+     * character rows are used. An account starts with none of them until the player creates one.
+     */
+    state::AccountState characterTemplates;
     /** Small local destination fallback published when State starts. */
     state::activity::defaults::ActivityDefaults initialActivityDefaults;
     /** Authored acquired-flag and objective policy published into the account object. */
